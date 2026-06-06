@@ -1,0 +1,131 @@
+from fastapi import APIRouter, Depends, HTTPException, status, Request, UploadFile, File
+from sqlmodel import select
+from models import UserRead, User, UserCreate, password_hash, AuthModel, UserUpdate
+from database import SessionDep
+from services.access_token import get_current_user
+from services.image_service import image_service
+from routers.auth import create_tokens_for_user
+
+router = APIRouter(prefix="/user", tags=["Users"])
+
+
+@router.post("", response_model=AuthModel, status_code=status.HTTP_201_CREATED)
+def create_user(user: UserCreate, session: SessionDep):
+    existing_user = session.exec(select(User).where(User.email == user.email)).first()
+
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Email already reistered"
+        )
+
+    hashed_pwd = password_hash.hash(user.password)
+    new_user = User(name=user.name, email=user.email, hashed_password=hashed_pwd)
+    session.add(new_user)
+    session.commit()
+    session.refresh(new_user)
+
+    access_token, refresh_token = create_tokens_for_user(new_user, session)
+
+    return {
+        "user": new_user,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+    }
+
+@router.patch("", response_model=UserRead)
+def update_user(
+    request: Request,
+    user_update: UserUpdate,
+    session: SessionDep,
+    current_user: User = Depends(get_current_user)
+):
+    """Update user profile information"""
+    user_data = user_update.model_dump(exclude_unset=True)
+    
+    # Check email uniqueness if updating email
+    if "email" in user_data:
+        existing = session.exec(
+            select(User).where(
+                User.email == user_data["email"],
+                User.id != current_user.id
+            )
+        ).first()
+        if existing:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email already in use"
+            )
+    
+    for key, value in user_data.items():
+        setattr(current_user, key, value)
+    
+    session.add(current_user)
+    session.commit()
+    session.refresh(current_user)
+    
+    user_response = UserRead.model_validate(current_user)
+    if current_user.profile_image_url:
+        base_url = str(request.base_url).rstrip('/')
+        user_response.profile_image_url = image_service.get_image_url(
+            current_user.profile_image_url,
+            base_url
+        )
+    return user_response
+
+@router.post("/profile-image")
+def upload_profile_image(
+    request: Request,
+    session: SessionDep,
+    current_user: User = Depends(get_current_user),
+    file: UploadFile = File(...),
+):
+    """Upload or update user profile image"""
+    # Delete old image if exists
+    if current_user.profile_image_url:
+        image_service.delete_image(current_user.profile_image_url)
+    
+    # Save new image
+    image_path = image_service.save_image(file, current_user.id)
+    
+    # Update user record
+    current_user.profile_image_url = image_path
+    session.add(current_user)
+    session.commit()
+    session.refresh(current_user)
+    
+    # Return full URL
+    base_url = str(request.base_url).rstrip('/')
+    full_url = image_service.get_image_url(image_path, base_url)
+    
+    return {
+        "message": "Profile image uploaded successfully",
+        "profile_image_url": full_url
+    }
+
+
+@router.delete("/profile-image", status_code=status.HTTP_204_NO_CONTENT)
+def delete_profile_image(
+    session: SessionDep,
+    current_user: User = Depends(get_current_user)
+):
+    """Delete user profile image"""
+    if not current_user.profile_image_url:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No profile image found"
+        )
+    
+    # Delete image file
+    image_service.delete_image(current_user.profile_image_url)
+    
+    # Update user record
+    current_user.profile_image_url = None
+    session.add(current_user)
+    session.commit()
+    
+    return None
+
+@router.get("", response_model=UserRead)
+def get_user(current_user: User = Depends(get_current_user)):
+    return current_user
