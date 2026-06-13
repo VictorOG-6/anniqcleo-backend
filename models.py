@@ -24,6 +24,11 @@ class GoogleUser(SQLModel):
 class UserBase(SQLModel):
     name: Optional[str] = Field(default=None)
     email: EmailStr = Field(unique=True, index=True)
+
+class UserRole(str, Enum):
+    USER = "user"
+    ADMIN = "admin"
+    STAFF = "staff"
     
 class User(UserBase, table=True):
     id: Optional[UUID] = Field(
@@ -44,8 +49,9 @@ class User(UserBase, table=True):
     cart: "Cart" = Relationship(back_populates="user")
     orders: list["Order"] = Relationship(back_populates="user")
     reviews: list["Review"] = Relationship(back_populates="user")
-    total_orders: int
-    total_spent: int
+    total_orders: int = Field(default=0)
+    total_spent: int = Field(default=0)
+    role: UserRole = Field(default=UserRole.USER)
 
 class UserRead(UserBase):
     id: UUID
@@ -57,6 +63,7 @@ class UserRead(UserBase):
     cart: "CartRead"
     total_orders: int
     total_spent: int
+    role: UserRole
 
 class UserCreate(UserBase):
     profile_image_url: Optional[str] = Field(default=None)
@@ -101,11 +108,25 @@ class RefreshToken(SQLModel, table=True):
     )
     revoked: bool = Field(default=False)
 
+class UserAuthRead(UserBase):
+    id: UUID
+    profile_image_url: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+    total_orders: int
+    total_spent: int
+    role: UserRole
+
 class AuthModel(SQLModel):
-    user: UserRead
+    user: UserAuthRead
     access_token: str
     refresh_token: str
     token_type: str
+
+class ProductStatus(str, Enum):
+    DRAFT = "draft"
+    PUBLISHED = "published"
+    ARCHIVED = "archived"
 
 class ProductVariant(SQLModel, table=True):
     id: Optional[UUID] = Field(
@@ -134,6 +155,7 @@ class Product(ProductBase, table=True):
         default_factory=uuid4,
         sa_column=Column(PG_UUID(as_uuid=True), primary_key=True, unique=True, nullable=False),
     )
+    slug: str = Field(index=True, unique=True)
     created_at: datetime = Field(
         default_factory=datetime.now,
          sa_column=Column(DateTime(timezone=True), nullable=False),
@@ -146,17 +168,23 @@ class Product(ProductBase, table=True):
     total_reviews: int
     average_rating: int
     variants: list["ProductVariant"] = Relationship(back_populates="product")
+    order_items: list["OrderItem"] = Relationship(back_populates="product")
+    cart_items: list["CartItem"] = Relationship(back_populates="product")
+    status: ProductStatus = Field(default=ProductStatus.DRAFT)
 
 class ProductCreate(ProductBase):
     variants: Optional[list[str]] = None
+    status: ProductStatus = ProductStatus.DRAFT
 
 class ProductRead(ProductBase):
     id: UUID
+    slug: str
     created_at: datetime
     updated_at: datetime
     total_reviews: int
     average_rating: int
     variants: list["ProductVariantRead"]
+    status: ProductStatus
 
 class ProductUpdate(SQLModel):
     name: Optional[str] = None
@@ -165,6 +193,25 @@ class ProductUpdate(SQLModel):
     category: Optional[str] = None
     description: Optional[str] = None
     variants: Optional[list[str]] = None
+    status: Optional[ProductStatus] = None
+
+class DashboardSummary(SQLModel):
+    total_revenue: int
+    revenue_change_percent: Optional[float] = None
+    total_orders: int
+    orders_change_percent: Optional[float] = None
+    total_customers: int
+    customers_change_percent: Optional[float] = None
+    total_products: int
+
+class TopSellingProduct(SQLModel):
+    product: ProductRead
+    quantity_sold: int
+    revenue: int
+
+class ProductCategorySummary(SQLModel):
+    category: str
+    product_count: int
 
 class OrderStatus(str, Enum):
     PENDING = "pending"
@@ -180,6 +227,7 @@ class Order(SQLModel, table=True):
         default_factory=uuid4,
         sa_column=Column(PG_UUID(as_uuid=True), primary_key=True, unique=True, nullable=False),
     )
+    public_id: str = Field(index=True, unique=True)
     created_at: datetime = Field(
         default_factory=datetime.now,
         sa_column=Column(DateTime(timezone=True), nullable=False),
@@ -205,6 +253,7 @@ class Order(SQLModel, table=True):
 
 class OrderRead(SQLModel):
     id: UUID
+    public_id: str
     created_at: datetime
     updated_at: datetime
     user_id: UUID

@@ -4,7 +4,7 @@ from sqlmodel import select
 from datetime import datetime, timezone, timedelta
 import jwt
 from jwt.exceptions import InvalidTokenError
-from models import TokenData, User
+from models import TokenData, User, UserRole
 from database import SessionDep
 import secrets
 import os
@@ -56,6 +56,16 @@ async def get_current_user(
     if user is None:
         raise credentials_exception
     return user
+
+
+async def get_current_admin(current_user: User = Depends(get_current_user)) -> User:
+    if current_user.role != UserRole.ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required",
+        )
+    return current_user
+
 
 async def get_current_user_by_id(
     session: SessionDep, token: str = Depends(oauth2_scheme)

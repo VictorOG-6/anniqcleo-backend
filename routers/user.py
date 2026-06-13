@@ -1,13 +1,14 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Request, UploadFile, File
-from sqlmodel import select
-from models import UserRead, User, UserCreate, password_hash, AuthModel, UserUpdate
+from fastapi import APIRouter, Depends, HTTPException, status, Request, UploadFile, File, Query
+from sqlmodel import select, col
+from sqlalchemy.orm import selectinload
+from models import UserRead, User, UserCreate, password_hash, AuthModel, UserUpdate, UserRole, Order, OrderItem, Cart
 from database import SessionDep
-from services.access_token import get_current_user
+from services.access_token import get_current_user, get_current_admin
 from services.image_service import image_service
 from routers.auth import create_tokens_for_user
+from typing import Optional
 
 router = APIRouter(prefix="/user", tags=["Users"])
-
 
 @router.post("", response_model=AuthModel, status_code=status.HTTP_201_CREATED)
 def create_user(user: UserCreate, session: SessionDep):
@@ -21,6 +22,8 @@ def create_user(user: UserCreate, session: SessionDep):
     hashed_pwd = password_hash.hash(user.password)
     new_user = User(name=user.name, email=user.email, hashed_password=hashed_pwd)
     session.add(new_user)
+    session.flush()
+    session.add(Cart(user_id=new_user.id, total_price=0, total_products=0))
     session.commit()
     session.refresh(new_user)
 
@@ -129,3 +132,38 @@ def delete_profile_image(
 @router.get("", response_model=UserRead)
 def get_user(current_user: User = Depends(get_current_user)):
     return current_user
+
+@router.get("/all", response_model=list[UserRead])
+def get_users(
+    session: SessionDep,
+    current_admin: User = Depends(get_current_admin),
+    page: int = Query(1, description="Page number", ge=1),
+    page_size: int = Query(10, description="Number of items per page", ge=1, le=100),
+    name: Optional[str] = Query(None, description="Filter users by name (partial match)"),
+    email: Optional[str] = Query(None, description="Filter users by email (partial match)"),
+    role: Optional[UserRole] = Query(None, description="Filter users by role"),
+):
+    statement = (
+        select(User)
+        .options(
+            selectinload(User.orders)
+            .selectinload(Order.order_items)
+            .selectinload(OrderItem.product),
+        )
+        .order_by(User.created_at.desc())
+    )
+
+    if name:
+        statement = statement.where(col(User.name).contains(name))
+
+    if email:
+        statement = statement.where(col(User.email).contains(email))
+
+    if role:
+        statement = statement.where(User.role == role)
+
+    offset = (page - 1) * page_size
+    statement = statement.offset(offset).limit(page_size)
+
+    users = session.exec(statement).all()
+    return users

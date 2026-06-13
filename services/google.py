@@ -1,5 +1,5 @@
 from sqlmodel import Session, select
-from models import User, GoogleUser
+from models import User, GoogleUser, Cart
 
 def get_user_by_google_sub(google_sub: str, session: Session) -> User | None:
     """Retrieve user by Google subject ID"""
@@ -47,6 +47,8 @@ def get_or_create_google_user(google_user: GoogleUser, session: Session) -> User
         name=google_user.name or google_user.email.split('@')[0],        
     )
     session.add(new_user)
+    session.flush()
+    session.add(Cart(user_id=new_user.id, total_price=0, total_products=0))
     session.commit()
     session.refresh(new_user)
     return new_user

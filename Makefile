@@ -39,6 +39,7 @@ help: ## Show this help message
 	@echo   shell          Open shell in app container
 	@echo   db-migrate     Run database migrations
 	@echo   db-rollback    Rollback last migration
+	@echo   create-admin   Create initial admin user
 	@echo   lint           Run linting
 	@echo   format         Format code
 	@echo   tag            Tag image for registry
@@ -215,6 +216,12 @@ db-history: ## Show migration history
 .PHONY: db-current
 db-current: ## Show current migration version
 	docker compose -f $(COMPOSE_FILE) exec app alembic current
+
+.PHONY: create-admin
+create-admin: check-env db-migrate ## Create initial admin user
+	@echo Creating admin user...
+	docker compose -f $(COMPOSE_FILE) exec app python scripts/create_admin.py
+	@echo Admin creation complete!
 
 .PHONY: lint
 lint: ## Run linting

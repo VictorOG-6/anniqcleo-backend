@@ -1,10 +1,11 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import selectinload
-from sqlmodel import select
+from sqlmodel import select, col
 from models import Order, OrderRead, OrderItem, Cart, CartItem, User, OrderStatus
 from database import SessionDep
 from services.access_token import get_current_user
 from datetime import datetime, timezone
+from typing import Optional
 from uuid import UUID
 
 router = APIRouter(prefix="/order", tags=["Orders"])
@@ -12,6 +13,23 @@ router = APIRouter(prefix="/order", tags=["Orders"])
 def process_order_refund(order: Order) -> bool:
     # Replace this with the third-party payment provider refund call.
     return True
+
+def generate_next_order_public_id(session: SessionDep) -> str:
+    public_ids = session.exec(select(Order.public_id)).all()
+    highest_number = 0
+
+    for public_id in public_ids:
+        if not public_id.startswith("ord-"):
+            continue
+
+        try:
+            order_number = int(public_id.removeprefix("ord-"))
+        except ValueError:
+            continue
+
+        highest_number = max(highest_number, order_number)
+
+    return f"ord-{highest_number + 1:04d}"
 
 @router.post("", response_model=OrderRead, status_code=status.HTTP_201_CREATED)
 def create_order(
@@ -52,6 +70,7 @@ def create_order(
     total_price = sum(item.quantity * item.price_at_purchase for item in order_items)
     # 4. Create order
     order = Order(
+        public_id=generate_next_order_public_id(session),
         user_id=current_user.id,
         total_price=total_price,
         total_products=total_products,
@@ -82,15 +101,34 @@ def create_order(
 def get_orders(
     session: SessionDep,
     current_user: User = Depends(get_current_user),
+    page: int = Query(1, description="Page number", ge=1),
+    page_size: int = Query(10, description="Number of items per page", ge=1, le=100),
+    status: Optional[OrderStatus] = Query(None, description="Filter orders by status"),
+    name: Optional[str] = Query(
+        None,
+        description="Filter orders by the name of the user who owns the order (partial match)",
+    ),
 ):
-    orders = session.exec(
+    statement = (
         select(Order)
-        .where(Order.user_id == current_user.id)
+        .join(User, Order.user_id == User.id)
         .options(
             selectinload(Order.order_items).selectinload(OrderItem.product),
             selectinload(Order.user),
         )
-    ).all()
+        .order_by(Order.created_at.desc())
+    )
+
+    if status:
+        statement = statement.where(Order.status == status)
+
+    if name:
+        statement = statement.where(col(User.name).contains(name))
+
+    offset = (page - 1) * page_size
+    statement = statement.offset(offset).limit(page_size)
+
+    orders = session.exec(statement).all()
     return orders
 
 @router.patch("/{order_id}/cancel", response_model=OrderRead)
