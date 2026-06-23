@@ -1,7 +1,9 @@
 from fastapi import FastAPI
-from routers import auth, user, product, cart, order, review, dashboard
+from fastapi.staticfiles import StaticFiles
+from routers import auth, user, product, cart, order, review, dashboard, image
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
+from services.image_service import image_service
 import os
 
 app = FastAPI()
@@ -30,9 +32,12 @@ app.add_middleware(
 def health():
     return {'status': 'ok'}
 
+app.mount("/uploads", StaticFiles(directory=image_service.UPLOAD_ROOT), name="uploads")
+
 app.include_router(auth.router)
 app.include_router(user.router)
 app.include_router(product.router)
+app.include_router(image.router)
 app.include_router(cart.router)
 app.include_router(order.router)
 app.include_router(review.router)

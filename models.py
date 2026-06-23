@@ -58,12 +58,14 @@ class UserRead(UserBase):
     profile_image_url: Optional[str] = None
     created_at: datetime
     updated_at: datetime
-    orders: list["OrderRead"]
-    reviews: list["ReviewRead"]
-    cart: "CartRead"
     total_orders: int
     total_spent: int
     role: UserRole
+
+class UserWithRelationsRead(UserRead):
+    orders: list["OrderRead"] = Field(default_factory=list)
+    reviews: list["ReviewRead"] = Field(default_factory=list)
+    cart: Optional["CartRead"] = None
 
 class UserCreate(UserBase):
     profile_image_url: Optional[str] = Field(default=None)
@@ -108,17 +110,8 @@ class RefreshToken(SQLModel, table=True):
     )
     revoked: bool = Field(default=False)
 
-class UserAuthRead(UserBase):
-    id: UUID
-    profile_image_url: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
-    total_orders: int
-    total_spent: int
-    role: UserRole
-
 class AuthModel(SQLModel):
-    user: UserAuthRead
+    user: UserRead
     access_token: str
     refresh_token: str
     token_type: str
@@ -165,8 +158,8 @@ class Product(ProductBase, table=True):
         sa_column=Column(DateTime(timezone=True), nullable=False, onupdate=func.now()),
     )
     reviews: list["Review"] = Relationship(back_populates="product")
-    total_reviews: int
-    average_rating: int
+    total_reviews: int = Field(default=0)
+    average_rating: int = Field(default=0)
     variants: list["ProductVariant"] = Relationship(back_populates="product")
     order_items: list["OrderItem"] = Relationship(back_populates="product")
     cart_items: list["CartItem"] = Relationship(back_populates="product")

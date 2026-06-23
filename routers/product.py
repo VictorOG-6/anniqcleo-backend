@@ -1,7 +1,7 @@
 from fastapi import APIRouter, status, Depends, Query, HTTPException
 from models import ProductRead, ProductCreate, Product, ProductUpdate, ProductVariant, User, ProductStatus, ProductCategorySummary, OrderItem
 from database import SessionDep
-from services.access_token import get_current_user
+from services.access_token import get_current_admin
 from typing import Optional
 from sqlmodel import select, col
 from sqlalchemy import func
@@ -31,7 +31,7 @@ def generate_unique_product_slug(session: SessionDep, name: str, product_id: Opt
         slug = f"{base_slug}-{suffix}"
 
 @router.post("", response_model=ProductRead, status_code=status.HTTP_201_CREATED)
-def create_product(product: ProductCreate, session: SessionDep, current_user: User = Depends(get_current_user)):
+def create_product(product: ProductCreate, session: SessionDep, current_admin: User = Depends(get_current_admin)):
     # Extract variants before creating product
     variants_data = product.variants or []
     product_data = product.model_dump(exclude={"variants"})
@@ -90,14 +90,14 @@ def get_product_categories_summary(
     ]
 
 @router.get("/{product_id}", response_model=ProductRead)
-def get_product_by_id(product_id: str, session: SessionDep, current_user: User = Depends(get_current_user)):
+def get_product_by_id(product_id: str, session: SessionDep):
     product = session.exec(select(Product).where(Product.id == product_id)).first()
     if not product:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
     return product
 
 @router.put("/{product_id}", response_model=ProductRead, status_code=status.HTTP_202_ACCEPTED)
-def update_product(product_id: str, product_update: ProductUpdate, session: SessionDep, current_user: User = Depends(get_current_user)):
+def update_product(product_id: str, product_update: ProductUpdate, session: SessionDep, current_admin: User = Depends(get_current_admin)):
     updated_product = session.exec(select(Product).where(Product.id == product_id)).first()
     if not updated_product:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
@@ -124,7 +124,7 @@ def update_product(product_id: str, product_update: ProductUpdate, session: Sess
 def delete_product(
     product_id: str,
     session: SessionDep,
-    current_user: User = Depends(get_current_user)
+    current_admin: User = Depends(get_current_admin)
 ):
     product = session.exec(
         select(Product).where(Product.id == product_id)

@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Request, UploadFile, File, Query
 from sqlmodel import select, col
 from sqlalchemy.orm import selectinload
-from models import UserRead, User, UserCreate, password_hash, AuthModel, UserUpdate, UserRole, Order, OrderItem, Cart
+from models import UserRead, User, UserCreate, password_hash, AuthModel, UserUpdate, UserRole, Order, OrderItem
 from database import SessionDep
 from services.access_token import get_current_user, get_current_admin
 from services.image_service import image_service
@@ -9,6 +9,17 @@ from routers.auth import create_tokens_for_user
 from typing import Optional
 
 router = APIRouter(prefix="/user", tags=["Users"])
+
+
+def build_user_response(user: User, request: Request) -> UserRead:
+    user_response = UserRead.model_validate(user)
+    if user.profile_image_url:
+        base_url = str(request.base_url).rstrip('/')
+        user_response.profile_image_url = image_service.get_image_url(
+            user.profile_image_url,
+            base_url
+        )
+    return user_response
 
 @router.post("", response_model=AuthModel, status_code=status.HTTP_201_CREATED)
 def create_user(user: UserCreate, session: SessionDep):
@@ -22,8 +33,6 @@ def create_user(user: UserCreate, session: SessionDep):
     hashed_pwd = password_hash.hash(user.password)
     new_user = User(name=user.name, email=user.email, hashed_password=hashed_pwd)
     session.add(new_user)
-    session.flush()
-    session.add(Cart(user_id=new_user.id, total_price=0, total_products=0))
     session.commit()
     session.refresh(new_user)
 
@@ -67,14 +76,7 @@ def update_user(
     session.commit()
     session.refresh(current_user)
     
-    user_response = UserRead.model_validate(current_user)
-    if current_user.profile_image_url:
-        base_url = str(request.base_url).rstrip('/')
-        user_response.profile_image_url = image_service.get_image_url(
-            current_user.profile_image_url,
-            base_url
-        )
-    return user_response
+    return build_user_response(current_user, request)
 
 @router.post("/profile-image")
 def upload_profile_image(
@@ -89,7 +91,7 @@ def upload_profile_image(
         image_service.delete_image(current_user.profile_image_url)
     
     # Save new image
-    image_path = image_service.save_image(file, current_user.id)
+    image_path = image_service.save_image(file, "profile")
     
     # Update user record
     current_user.profile_image_url = image_path
@@ -130,11 +132,15 @@ def delete_profile_image(
     return None
 
 @router.get("", response_model=UserRead)
-def get_user(current_user: User = Depends(get_current_user)):
-    return current_user
+def get_user(
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    return build_user_response(current_user, request)
 
 @router.get("/all", response_model=list[UserRead])
 def get_users(
+    request: Request,
     session: SessionDep,
     current_admin: User = Depends(get_current_admin),
     page: int = Query(1, description="Page number", ge=1),
@@ -166,4 +172,4 @@ def get_users(
     statement = statement.offset(offset).limit(page_size)
 
     users = session.exec(statement).all()
-    return users
+    return [build_user_response(user, request) for user in users]

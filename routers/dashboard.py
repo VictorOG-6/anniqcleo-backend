@@ -12,6 +12,7 @@ from models import (
     OrderItem,
     OrderStatus,
     Product,
+    ProductStatus,
     TopSellingProduct,
     User,
 )
@@ -91,7 +92,7 @@ def get_dashboard_summary(
         )
     ).one()
     total_products = session.exec(
-    select(func.count(Product.id)).where(
+        select(func.count(Product.id)).where(
             Product.status == ProductStatus.PUBLISHED
         )
     ).one()
