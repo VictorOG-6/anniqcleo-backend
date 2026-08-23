@@ -32,15 +32,19 @@ def generate_unique_product_slug(session: SessionDep, name: str, product_id: Opt
 
 @router.post("", response_model=ProductRead, status_code=status.HTTP_201_CREATED)
 def create_product(product: ProductCreate, session: SessionDep, current_admin: User = Depends(get_current_admin)):
-    # Extract variants before creating product
     variants_data = product.variants or []
     product_data = product.model_dump(exclude={"variants"})
     product_data["slug"] = generate_unique_product_slug(session, product.name)
+    if variants_data:
+        product_data["quantity"] = sum(variant.quantity for variant in variants_data)
 
     new_product = Product(**product_data)
-    new_product.variants = [ProductVariant(color=c) for c in variants_data]
-
+    new_product.variants = [
+        ProductVariant(**variant.model_dump())
+        for variant in variants_data
+    ]
     session.add(new_product)
+
     session.commit()
     session.refresh(new_product)
     return new_product
@@ -102,20 +106,28 @@ def update_product(product_id: str, product_update: ProductUpdate, session: Sess
     if not updated_product:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
 
-    # Update scalar fields only
     product_data = product_update.model_dump(exclude_unset=True, exclude={"variants"})
     if product_data.get("name") is not None:
         product_data["slug"] = generate_unique_product_slug(session, product_data["name"], product_id)
+
+    if product_update.variants:
+        product_data["quantity"] = sum(
+            variant.quantity for variant in product_update.variants
+        )
+    elif product_update.variants is None and updated_product.variants:
+        product_data["quantity"] = sum(
+            variant.quantity for variant in updated_product.variants
+        )
+
     updated_product.sqlmodel_update(product_data)
 
-    # Sync variants only if explicitly provided
     if product_update.variants is not None:
-        for variant in updated_product.variants:
-            session.delete(variant)
-        session.flush()  # ensure deletes run before inserts
-        updated_product.variants = [ProductVariant(color=c) for c in product_update.variants]
+        updated_product.variants.clear()
+        updated_product.variants.extend(
+            ProductVariant(**variant.model_dump())
+            for variant in product_update.variants
+        )
 
-    session.add(updated_product)
     session.commit()
     session.refresh(updated_product)
     return updated_product

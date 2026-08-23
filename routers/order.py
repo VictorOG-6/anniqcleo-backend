@@ -1,18 +1,50 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import selectinload
 from sqlmodel import select, col
-from models import Order, OrderRead, OrderItem, Cart, CartItem, User, OrderStatus
+from models import (
+    Cart,
+    CartItem,
+    CheckoutRead,
+    Order,
+    OrderItem,
+    OrderRead,
+    OrderStatus,
+    OrderStatusUpdate,
+    Payment,
+    PaymentStatus,
+    Refund,
+    RefundStatus,
+    ProductVariant,
+    User,
+    UserRole,
+)
 from database import SessionDep
-from services.access_token import get_current_user
-from datetime import datetime, timezone
+from services.access_token import (
+    get_current_admin,
+    get_current_admin_or_staff,
+    get_current_user,
+)
+from services.payment_lifecycle import initialize_payment, verify_payment
+from services.inventory import restore_inventory_for_order
+from services.paystack import PaystackError, paystack_service
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
 
 router = APIRouter(prefix="/order", tags=["Orders"])
 
-def process_order_refund(order: Order) -> bool:
-    # Replace this with the third-party payment provider refund call.
-    return True
+_ORDER_READ_OPTIONS = (
+    selectinload(Order.order_items).selectinload(OrderItem.product),
+    selectinload(Order.order_items).selectinload(OrderItem.product_variant),
+    selectinload(Order.user),
+)
+
+def load_order_for_read(session: SessionDep, order_id: UUID) -> Order:
+    return session.exec(
+        select(Order)
+        .where(Order.id == order_id)
+        .options(*_ORDER_READ_OPTIONS)
+    ).one()
 
 def generate_next_order_public_id(session: SessionDep) -> str:
     public_ids = session.exec(select(Order.public_id)).all()
@@ -31,7 +63,7 @@ def generate_next_order_public_id(session: SessionDep) -> str:
 
     return f"ord-{highest_number + 1:04d}"
 
-@router.post("", response_model=OrderRead, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=CheckoutRead, status_code=status.HTTP_201_CREATED)
 def create_order(
     session: SessionDep,
     current_user: User = Depends(get_current_user),
@@ -41,7 +73,8 @@ def create_order(
         select(Cart)
         .where(Cart.user_id == current_user.id)
         .options(
-            selectinload(Cart.items).selectinload(CartItem.product)
+            selectinload(Cart.items).selectinload(CartItem.product),
+            selectinload(Cart.items).selectinload(CartItem.product_variant),
         )
     ).first()
     if not cart or not cart.items:
@@ -58,9 +91,38 @@ def create_order(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Product {cart_item.product_id} not found",
             )
+        if cart_item.product_variant_id is not None:
+            variant = cart_item.product_variant
+            if not variant or variant.product_id != product.id:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"The selected variant for {product.name} is unavailable",
+                )
+            if cart_item.quantity > variant.quantity:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Only {variant.quantity} units of {variant.name} are available",
+                )
+        else:
+            has_variants = session.exec(
+                select(ProductVariant.id).where(
+                    ProductVariant.product_id == product.id
+                )
+            ).first()
+            if has_variants:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"A variant is required for product {product.name}",
+                )
+            if cart_item.quantity > product.quantity:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Only {product.quantity} units of {product.name} are available",
+                )
         order_items.append(
             OrderItem(
                 product_id=cart_item.product_id,
+                product_variant_id=cart_item.product_variant_id,
                 quantity=cart_item.quantity,
                 price_at_purchase=product.price,  # snapshot unit price
             )
@@ -81,7 +143,9 @@ def create_order(
     for item in order_items:
         item.order_id = order.id
         session.add(item)
-    # 6. Optional: clear cart after successful checkout
+    # 6. Initialize the server-owned Paystack transaction.
+    payment = initialize_payment(session, order=order, user=current_user)
+    # 7. Clear the cart after the checkout snapshot and payment session exist.
     for cart_item in cart.items:
         session.delete(cart_item)
     session.commit()
@@ -92,10 +156,12 @@ def create_order(
         .where(Order.id == order.id)
         .options(
             selectinload(Order.order_items).selectinload(OrderItem.product),
+            selectinload(Order.order_items).selectinload(OrderItem.product_variant),
             selectinload(Order.user),
         )
     ).one()
-    return order
+    session.refresh(payment)
+    return CheckoutRead(order=order, payment=payment)
 
 @router.get("", response_model=list[OrderRead])
 def get_orders(
@@ -114,6 +180,7 @@ def get_orders(
         .join(User, Order.user_id == User.id)
         .options(
             selectinload(Order.order_items).selectinload(OrderItem.product),
+            selectinload(Order.order_items).selectinload(OrderItem.product_variant),
             selectinload(Order.user),
         )
         .order_by(Order.created_at.desc())
@@ -125,11 +192,55 @@ def get_orders(
     if name:
         statement = statement.where(col(User.name).contains(name))
 
+    if current_user.role not in {UserRole.ADMIN, UserRole.STAFF}:
+        statement = statement.where(Order.user_id == current_user.id)
+
     offset = (page - 1) * page_size
     statement = statement.offset(offset).limit(page_size)
 
     orders = session.exec(statement).all()
     return orders
+
+@router.patch("/{order_id}", response_model=OrderRead)
+def update_order_status(
+    order_id: UUID,
+    update: OrderStatusUpdate,
+    session: SessionDep,
+    _: User = Depends(get_current_admin),
+):
+    order = session.exec(
+        select(Order)
+        .where(Order.id == order_id)
+        .with_for_update()
+        .options(*_ORDER_READ_OPTIONS)
+    ).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order.status == update.status:
+        return order
+
+    now = datetime.now(timezone.utc)
+    previous_status = order.status
+    order.status = update.status
+
+    if update.status == OrderStatus.CONFIRMED and order.confirmed_at is None:
+        order.confirmed_at = now
+    elif update.status == OrderStatus.COMPLETED:
+        order.completed_at = now
+        if previous_status != OrderStatus.COMPLETED:
+            user = session.get(User, order.user_id)
+            if user:
+                user.total_orders += 1
+                user.total_spent += order.total_price
+                session.add(user)
+    elif update.status == OrderStatus.CANCELLED:
+        order.cancelled_at = now
+    elif update.status == OrderStatus.REFUNDED:
+        order.refunded_at = now
+
+    session.add(order)
+    session.commit()
+    return load_order_for_read(session, order_id)
 
 @router.patch("/{order_id}/cancel", response_model=OrderRead)
 def cancel_order(
@@ -140,38 +251,151 @@ def cancel_order(
     order = session.exec(
         select(Order)
         .where(Order.id == order_id, Order.user_id == current_user.id)
+        .with_for_update()
         .options(
             selectinload(Order.order_items).selectinload(OrderItem.product),
+            selectinload(Order.order_items).selectinload(OrderItem.product_variant),
             selectinload(Order.user),
         )
     ).first()
     if not order:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
-    if order.status not in {OrderStatus.PENDING, OrderStatus.PROCESSING}:
+    if order.status == OrderStatus.REFUND_PENDING:
+        return order
+
+    if order.status == OrderStatus.PROCESSING:
+        latest_payment = session.exec(
+            select(Payment)
+            .where(Payment.order_id == order.id)
+            .order_by(Payment.created_at.desc())
+        ).first()
+        if latest_payment:
+            verify_payment(session, latest_payment)
+            session.flush()
+            session.refresh(order)
+
+    if order.status in {OrderStatus.PENDING, OrderStatus.FAILED}:
+        order.status = OrderStatus.CANCELLED
+        order.cancelled_at = datetime.now(timezone.utc)
+        session.add(order)
+        session.commit()
+        session.refresh(order)
+        return order
+
+    if order.status != OrderStatus.CONFIRMED:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only pending or processing orders can be cancelled",
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Only unpaid or confirmed, unfulfilled orders can be cancelled",
         )
 
     now = datetime.now(timezone.utc)
-    order.status = OrderStatus.CANCELLED
-    order.cancelled_at = now
-    session.add(order)
-    session.commit()
-    session.refresh(order)
-
-    if not process_order_refund(order):
+    confirmed_at = order.confirmed_at
+    if confirmed_at and confirmed_at.tzinfo is None:
+        confirmed_at = confirmed_at.replace(tzinfo=timezone.utc)
+    if not confirmed_at or now > confirmed_at + timedelta(minutes=30):
         raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Order cancelled, but refund could not be completed",
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The 30-minute refund window has expired",
         )
 
-    order.status = OrderStatus.REFUNDED
-    order.refunded_at = datetime.now(timezone.utc)
+    payment = session.exec(
+        select(Payment)
+        .where(
+            Payment.order_id == order.id,
+            Payment.status == PaymentStatus.SUCCESS,
+        )
+        .order_by(Payment.paid_at.desc())
+    ).first()
+    if not payment:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="No refundable payment was found",
+        )
+
+    existing_refund = session.exec(
+        select(Refund).where(Refund.payment_id == payment.id)
+    ).first()
+    if existing_refund:
+        return order
+
+    try:
+        result = paystack_service.create_full_refund(
+            transaction_reference=payment.reference,
+            merchant_note=f"Customer cancelled {order.public_id} within 30 minutes",
+        )
+    except PaystackError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    provider_status = str(result.get("status", "pending")).replace("-", "_")
+    refund_status = {
+        "pending": RefundStatus.PENDING,
+        "processing": RefundStatus.PROCESSING,
+        "needs_attention": RefundStatus.NEEDS_ATTENTION,
+        "processed": RefundStatus.PROCESSED,
+    }.get(provider_status, RefundStatus.PENDING)
+    refund = Refund(
+        payment_id=payment.id,
+        provider_refund_id=(
+            str(result["id"]) if result.get("id") is not None else None
+        ),
+        amount_kobo=payment.amount_kobo,
+        status=refund_status,
+    )
+    order.cancelled_at = now
+    if refund_status == RefundStatus.PROCESSED:
+        refund.processed_at = now
+        payment.status = PaymentStatus.REFUNDED
+        order.status = OrderStatus.REFUNDED
+        order.refunded_at = now
+        restore_inventory_for_order(session, order)
+    else:
+        payment.status = PaymentStatus.REFUND_PENDING
+        order.status = OrderStatus.REFUND_PENDING
+    session.add(refund)
+    session.add(payment)
     session.add(order)
     session.commit()
     session.refresh(order)
+    return order
 
+
+@router.patch("/{order_id}/complete", response_model=OrderRead)
+def complete_order(
+    order_id: UUID,
+    session: SessionDep,
+    _: User = Depends(get_current_admin_or_staff),
+):
+    order = session.exec(
+        select(Order)
+        .where(Order.id == order_id)
+        .with_for_update()
+        .options(
+            selectinload(Order.order_items).selectinload(OrderItem.product),
+            selectinload(Order.order_items).selectinload(OrderItem.product_variant),
+            selectinload(Order.user),
+        )
+    ).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order.status == OrderStatus.COMPLETED:
+        return order
+    if order.status != OrderStatus.CONFIRMED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Only confirmed orders can be completed",
+        )
+
+    now = datetime.now(timezone.utc)
+    order.status = OrderStatus.COMPLETED
+    order.completed_at = now
+    user = session.get(User, order.user_id)
+    if user:
+        user.total_orders += 1
+        user.total_spent += order.total_price
+        session.add(user)
+    session.add(order)
+    session.commit()
+    session.refresh(order)
     return order
 
 @router.get("/{order_id}", response_model=OrderRead)
@@ -185,6 +409,7 @@ def get_order(
         .where(Order.id == order_id, Order.user_id == current_user.id)
         .options(
             selectinload(Order.order_items).selectinload(OrderItem.product),
+            selectinload(Order.order_items).selectinload(OrderItem.product_variant),
             selectinload(Order.user),
         )
     ).first()

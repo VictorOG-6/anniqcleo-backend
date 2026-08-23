@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
-from routers import auth, user, product, cart, order, review, dashboard, image
+from routers import auth, user, product, cart, order, review, dashboard, image, payment
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from services.image_service import image_service
@@ -40,5 +40,6 @@ app.include_router(product.router)
 app.include_router(image.router)
 app.include_router(cart.router)
 app.include_router(order.router)
+app.include_router(payment.router)
 app.include_router(review.router)
 app.include_router(dashboard.router)

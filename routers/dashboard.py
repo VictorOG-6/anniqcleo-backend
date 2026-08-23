@@ -16,26 +16,14 @@ from models import (
     TopSellingProduct,
     User,
 )
-from services.access_token import get_current_user
+from services.access_token import get_current_admin_or_staff
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
 
 
-def get_month_ranges():
+def get_current_month_start() -> datetime:
     now = datetime.now(timezone.utc)
-    current_month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-
-    if current_month_start.month == 1:
-        previous_month_start = current_month_start.replace(
-            year=current_month_start.year - 1,
-            month=12,
-        )
-    else:
-        previous_month_start = current_month_start.replace(
-            month=current_month_start.month - 1,
-        )
-
-    return previous_month_start, current_month_start, now
+    return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
 
 def calculate_percentage_change(current_value: int, previous_value: int) -> float | None:
@@ -47,47 +35,39 @@ def calculate_percentage_change(current_value: int, previous_value: int) -> floa
 @router.get("/summary", response_model=DashboardSummary)
 def get_dashboard_summary(
     session: SessionDep,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin_or_staff),
 ):
-    previous_month_start, current_month_start, now = get_month_ranges()
+    current_month_start = get_current_month_start()
 
-    current_revenue = session.exec(
+    total_revenue = session.exec(
         select(func.coalesce(func.sum(Order.total_price), 0)).where(
             Order.status == OrderStatus.COMPLETED,
-            Order.created_at >= current_month_start,
-            Order.created_at < now,
         )
     ).one()
-    previous_revenue = session.exec(
+    revenue_at_previous_month_end = session.exec(
         select(func.coalesce(func.sum(Order.total_price), 0)).where(
             Order.status == OrderStatus.COMPLETED,
-            Order.created_at >= previous_month_start,
-            Order.created_at < current_month_start,
+            Order.completed_at < current_month_start,
         )
     ).one()
 
-    current_orders = session.exec(
+    total_orders = session.exec(
         select(func.count(Order.id)).where(
-            Order.created_at >= current_month_start,
-            Order.created_at < now,
+            Order.status == OrderStatus.COMPLETED,
         )
     ).one()
-    previous_orders = session.exec(
+    orders_at_previous_month_end = session.exec(
         select(func.count(Order.id)).where(
-            Order.created_at >= previous_month_start,
-            Order.created_at < current_month_start,
+            Order.status == OrderStatus.COMPLETED,
+            Order.completed_at < current_month_start,
         )
     ).one()
 
-    current_customers = session.exec(
-        select(func.count(User.id)).where(
-            User.created_at >= current_month_start,
-            User.created_at < now,
-        )
+    total_customers = session.exec(
+        select(func.count(User.id))
     ).one()
-    previous_customers = session.exec(
+    customers_at_previous_month_end = session.exec(
         select(func.count(User.id)).where(
-            User.created_at >= previous_month_start,
             User.created_at < current_month_start,
         )
     ).one()
@@ -98,20 +78,20 @@ def get_dashboard_summary(
     ).one()
 
     return DashboardSummary(
-        total_revenue=current_revenue,
+        total_revenue=total_revenue,
         revenue_change_percent=calculate_percentage_change(
-            current_revenue,
-            previous_revenue,
+            total_revenue,
+            revenue_at_previous_month_end,
         ),
-        total_orders=current_orders,
+        total_orders=total_orders,
         orders_change_percent=calculate_percentage_change(
-            current_orders,
-            previous_orders,
+            total_orders,
+            orders_at_previous_month_end,
         ),
-        total_customers=current_customers,
+        total_customers=total_customers,
         customers_change_percent=calculate_percentage_change(
-            current_customers,
-            previous_customers,
+            total_customers,
+            customers_at_previous_month_end,
         ),
         total_products=total_products,
     )
@@ -120,7 +100,7 @@ def get_dashboard_summary(
 @router.get("/top-products", response_model=list[TopSellingProduct])
 def get_top_selling_products(
     session: SessionDep,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_admin_or_staff),
     limit: int = Query(5, ge=1, le=50),
 ):
     statement = (

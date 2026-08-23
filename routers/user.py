@@ -155,6 +155,9 @@ def get_users(
             selectinload(User.orders)
             .selectinload(Order.order_items)
             .selectinload(OrderItem.product),
+            selectinload(User.orders)
+            .selectinload(Order.order_items)
+            .selectinload(OrderItem.product_variant),
         )
         .order_by(User.created_at.desc())
     )

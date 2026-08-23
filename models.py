@@ -62,6 +62,11 @@ class UserRead(UserBase):
     total_spent: int
     role: UserRole
 
+class UserSummary(SQLModel):
+    id: UUID
+    name: Optional[str] = None
+    email: EmailStr
+
 class UserWithRelationsRead(UserRead):
     orders: list["OrderRead"] = Field(default_factory=list)
     reviews: list["ReviewRead"] = Field(default_factory=list)
@@ -121,20 +126,28 @@ class ProductStatus(str, Enum):
     PUBLISHED = "published"
     ARCHIVED = "archived"
 
-class ProductVariant(SQLModel, table=True):
+class ProductVariantBase(SQLModel):
+    name: str
+    image_url: str
+    color: str
+    quantity: int = Field(ge=0)
+
+class ProductVariant(ProductVariantBase, table=True):
     id: Optional[UUID] = Field(
         default_factory=uuid4,
         sa_column=Column(PG_UUID(as_uuid=True), primary_key=True, unique=True, nullable=False),
     )
     product_id: UUID = Field(foreign_key="product.id", nullable=False)
-    color: str
     product: Optional["Product"] = Relationship(back_populates="variants")
+    order_items: list["OrderItem"] = Relationship(back_populates="product_variant")
+    cart_items: list["CartItem"] = Relationship(back_populates="product_variant")
 
-class ProductVariantRead(SQLModel):
+class ProductVariantCreate(ProductVariantBase):
+    pass
+
+class ProductVariantRead(ProductVariantBase):
     id: UUID
     product_id: UUID
-    color: str
-    product: "ProductRead"
 
 class ProductBase(SQLModel):
     name: str
@@ -142,6 +155,7 @@ class ProductBase(SQLModel):
     price: int
     category: str
     description: str
+    quantity: int = Field(default=0, ge=0)
 
 class Product(ProductBase, table=True):
     id: Optional[UUID] = Field(
@@ -157,16 +171,25 @@ class Product(ProductBase, table=True):
         default_factory=lambda: datetime.now(timezone.utc),
         sa_column=Column(DateTime(timezone=True), nullable=False, onupdate=func.now()),
     )
-    reviews: list["Review"] = Relationship(back_populates="product")
+    reviews: list["Review"] = Relationship(
+        back_populates="product",
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"},
+    )
     total_reviews: int = Field(default=0)
     average_rating: int = Field(default=0)
-    variants: list["ProductVariant"] = Relationship(back_populates="product")
+    variants: list["ProductVariant"] = Relationship(
+        back_populates="product",
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"},
+    )
     order_items: list["OrderItem"] = Relationship(back_populates="product")
-    cart_items: list["CartItem"] = Relationship(back_populates="product")
+    cart_items: list["CartItem"] = Relationship(
+        back_populates="product",
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"},
+    )
     status: ProductStatus = Field(default=ProductStatus.DRAFT)
 
 class ProductCreate(ProductBase):
-    variants: Optional[list[str]] = None
+    variants: Optional[list[ProductVariantCreate]] = None
     status: ProductStatus = ProductStatus.DRAFT
 
 class ProductRead(ProductBase):
@@ -185,7 +208,8 @@ class ProductUpdate(SQLModel):
     price: Optional[int] = None
     category: Optional[str] = None
     description: Optional[str] = None
-    variants: Optional[list[str]] = None
+    quantity: Optional[int] = Field(default=None, ge=0)
+    variants: Optional[list[ProductVariantCreate]] = None
     status: Optional[ProductStatus] = None
 
 class DashboardSummary(SQLModel):
@@ -212,8 +236,25 @@ class OrderStatus(str, Enum):
     CONFIRMED = "confirmed"
     CANCELLED = "cancelled"
     FAILED = "failed"
+    REFUND_PENDING = "refund_pending"
     REFUNDED = "refunded"
     COMPLETED = "completed"
+
+class PaymentStatus(str, Enum):
+    INITIALIZED = "initialized"
+    PENDING = "pending"
+    SUCCESS = "success"
+    FAILED = "failed"
+    ABANDONED = "abandoned"
+    REFUND_PENDING = "refund_pending"
+    REFUNDED = "refunded"
+
+class RefundStatus(str, Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    NEEDS_ATTENTION = "needs_attention"
+    PROCESSED = "processed"
+    FAILED = "failed"
 
 class Order(SQLModel, table=True):
     id: Optional[UUID] = Field(
@@ -234,12 +275,29 @@ class Order(SQLModel, table=True):
     total_products: int
     user_id: UUID = Field(foreign_key="user.id", nullable=False)
     user: Optional["User"] = Relationship(back_populates="orders")
+    payments: list["Payment"] = Relationship(back_populates="order")
     status: OrderStatus = Field(default=OrderStatus.PENDING)
+    confirmed_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(DateTime(timezone=True), nullable=True),
+    )
+    completed_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(DateTime(timezone=True), nullable=True),
+    )
     cancelled_at: Optional[datetime] = Field(
         default=None,
         sa_column=Column(DateTime(timezone=True), nullable=True),
     )
     refunded_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(DateTime(timezone=True), nullable=True),
+    )
+    inventory_committed_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(DateTime(timezone=True), nullable=True),
+    )
+    inventory_restored_at: Optional[datetime] = Field(
         default=None,
         sa_column=Column(DateTime(timezone=True), nullable=True),
     )
@@ -250,12 +308,97 @@ class OrderRead(SQLModel):
     created_at: datetime
     updated_at: datetime
     user_id: UUID
+    user: "UserSummary"
     order_items: list["OrderItemRead"]
     total_price: int
     total_products: int
     status: OrderStatus
+    confirmed_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
     cancelled_at: Optional[datetime] = None
     refunded_at: Optional[datetime] = None
+    inventory_committed_at: Optional[datetime] = None
+    inventory_restored_at: Optional[datetime] = None
+
+class OrderStatusUpdate(SQLModel):
+    status: OrderStatus
+
+class Payment(SQLModel, table=True):
+    id: Optional[UUID] = Field(
+        default_factory=uuid4,
+        sa_column=Column(PG_UUID(as_uuid=True), primary_key=True, unique=True, nullable=False),
+    )
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_column=Column(DateTime(timezone=True), nullable=False, onupdate=func.now()),
+    )
+    order_id: UUID = Field(foreign_key="order.id", nullable=False, index=True)
+    order: Optional["Order"] = Relationship(back_populates="payments")
+    reference: str = Field(unique=True, index=True)
+    provider_transaction_id: Optional[str] = Field(default=None, index=True)
+    amount_kobo: int
+    currency: str = Field(default="NGN", max_length=3)
+    status: PaymentStatus = Field(default=PaymentStatus.INITIALIZED)
+    access_code: Optional[str] = None
+    authorization_url: Optional[str] = None
+    paid_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(DateTime(timezone=True), nullable=True),
+    )
+    refunds: list["Refund"] = Relationship(back_populates="payment")
+
+class PaymentRead(SQLModel):
+    id: UUID
+    order_id: UUID
+    reference: str
+    amount_kobo: int
+    currency: str
+    status: PaymentStatus
+    authorization_url: Optional[str] = None
+    paid_at: Optional[datetime] = None
+
+class CheckoutRead(SQLModel):
+    order: OrderRead
+    payment: PaymentRead
+
+class Refund(SQLModel, table=True):
+    id: Optional[UUID] = Field(
+        default_factory=uuid4,
+        sa_column=Column(PG_UUID(as_uuid=True), primary_key=True, unique=True, nullable=False),
+    )
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+    updated_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_column=Column(DateTime(timezone=True), nullable=False, onupdate=func.now()),
+    )
+    payment_id: UUID = Field(foreign_key="payment.id", nullable=False, unique=True)
+    payment: Optional["Payment"] = Relationship(back_populates="refunds")
+    provider_refund_id: Optional[str] = Field(default=None, index=True)
+    amount_kobo: int
+    status: RefundStatus = Field(default=RefundStatus.PENDING)
+    processed_at: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(DateTime(timezone=True), nullable=True),
+    )
+
+class WebhookEvent(SQLModel, table=True):
+    id: Optional[UUID] = Field(
+        default_factory=uuid4,
+        sa_column=Column(PG_UUID(as_uuid=True), primary_key=True, unique=True, nullable=False),
+    )
+    fingerprint: str = Field(unique=True, index=True)
+    event_type: str = Field(index=True)
+    processed_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
 
 class OrderItem(SQLModel, table=True):
     id: Optional[UUID] = Field(
@@ -274,7 +417,14 @@ class OrderItem(SQLModel, table=True):
     order: Optional["Order"] = Relationship(back_populates="order_items")
     product_id: UUID = Field(foreign_key="product.id", nullable=False)
     product: Optional["Product"] = Relationship(back_populates="order_items")
-    quantity: int = 1
+    product_variant_id: Optional[UUID] = Field(
+        default=None,
+        foreign_key="productvariant.id",
+    )
+    product_variant: Optional["ProductVariant"] = Relationship(
+        back_populates="order_items"
+    )
+    quantity: int = Field(default=1, ge=1)
     price_at_purchase: int
 
 class OrderItemRead(SQLModel):
@@ -284,6 +434,8 @@ class OrderItemRead(SQLModel):
     order_id: UUID
     product_id: UUID
     product: "ProductRead"
+    product_variant_id: Optional[UUID] = None
+    product_variant: Optional["ProductVariantRead"] = None
     quantity: int
     price_at_purchase: int
     
@@ -317,7 +469,7 @@ class CartRead(SQLModel):
     total_products: int
 
 class CartItemBase(SQLModel):
-    quantity: int = 1
+    quantity: int = Field(default=1, ge=1)
 
 class CartItem(CartItemBase, table=True):
     id: Optional[UUID] = Field(
@@ -336,13 +488,21 @@ class CartItem(CartItemBase, table=True):
     cart: Optional["Cart"] = Relationship(back_populates="items")
     product_id: UUID = Field(foreign_key="product.id", nullable=False)
     product: Optional["Product"] = Relationship(back_populates="cart_items")
+    product_variant_id: Optional[UUID] = Field(
+        default=None,
+        foreign_key="productvariant.id",
+    )
+    product_variant: Optional["ProductVariant"] = Relationship(
+        back_populates="cart_items"
+    )
     total_price: int
     
 class CartItemCreate(CartItemBase):
     product_id: UUID
+    product_variant_id: Optional[UUID] = None
 
 class CartItemUpdate(SQLModel):
-    quantity: Optional[int] = None
+    quantity: Optional[int] = Field(default=None, ge=1)
 
 class CartItemRead(CartItemBase):
     id: UUID
@@ -351,6 +511,8 @@ class CartItemRead(CartItemBase):
     cart_id: UUID
     product_id: UUID
     product: "ProductRead"
+    product_variant_id: Optional[UUID] = None
+    product_variant: Optional["ProductVariantRead"] = None
     total_price: int
 
 class ReviewBase(SQLModel):
