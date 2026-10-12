@@ -14,7 +14,7 @@ from services.payment_lifecycle import (
     initialize_payment,
     verify_payment,
 )
-from services.paystack import paystack_service
+from services.afripay import afripay_service
 from models import Order
 
 
@@ -55,7 +55,7 @@ def initialize_order_payment(
     payment = initialize_payment(session, order=order, user=current_user)
     session.commit()
     session.refresh(payment)
-    return payment
+    return PaymentRead.model_validate(payment)
 
 
 @router.post("/{payment_id}/verify", response_model=PaymentRead)
@@ -69,10 +69,10 @@ def verify_order_payment(
         payment_id=payment_id,
         user_id=current_user.id,
     )
-    verify_payment(session, payment)
+    payment = verify_payment(session, payment)
     session.commit()
     session.refresh(payment)
-    return payment
+    return PaymentRead.model_validate(payment)
 
 
 @router.post("/reference/{reference}/verify", response_model=PaymentRead)
@@ -91,26 +91,26 @@ def verify_order_payment_by_reference(
     ).first()
     if not payment:
         raise HTTPException(status_code=404, detail="Payment not found")
-    verify_payment(session, payment)
+    payment = verify_payment(session, payment)
     session.commit()
     session.refresh(payment)
-    return payment
+    return PaymentRead.model_validate(payment)
 
 
 @router.post("/webhook", status_code=status.HTTP_200_OK)
-async def paystack_webhook(
+async def afripay_webhook(
     request: Request,
     session: SessionDep,
-    x_paystack_signature: str | None = Header(default=None),
+    x_afripay_signature: str | None = Header(default=None),
 ):
     raw_body = await request.body()
-    if not paystack_service.verify_webhook_signature(
+    if not afripay_service.verify_webhook_signature(
         raw_body,
-        x_paystack_signature,
+        x_afripay_signature,
     ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid Paystack signature",
+            detail="Invalid Afripay signature",
         )
 
     try:

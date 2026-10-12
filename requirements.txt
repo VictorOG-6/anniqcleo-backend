@@ -28,3 +28,5 @@ PyJWT
 python-multipart
 pillow
 itsdangerous
+resend[async]
+psycopg[binary]

@@ -8,15 +8,14 @@ from models import (
     Order,
     OrderItem,
     OrderRead,
+    PaymentRead,
     OrderStatus,
     OrderStatusUpdate,
     Payment,
     PaymentStatus,
     Refund,
     RefundStatus,
-    ProductVariant,
     User,
-    UserRole,
 )
 from database import SessionDep
 from services.access_token import (
@@ -25,8 +24,8 @@ from services.access_token import (
     get_current_user,
 )
 from services.payment_lifecycle import initialize_payment, verify_payment
-from services.inventory import restore_inventory_for_order
-from services.paystack import PaystackError, paystack_service
+from services.inventory import restore_inventory_for_order, validate_inventory_selection
+from services.afripay import AfripayError, afripay_service
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
@@ -36,6 +35,7 @@ router = APIRouter(prefix="/order", tags=["Orders"])
 _ORDER_READ_OPTIONS = (
     selectinload(Order.order_items).selectinload(OrderItem.product),
     selectinload(Order.order_items).selectinload(OrderItem.product_variant),
+    selectinload(Order.order_items).selectinload(OrderItem.product_sub_variant),
     selectinload(Order.user),
 )
 
@@ -75,6 +75,7 @@ def create_order(
         .options(
             selectinload(Cart.items).selectinload(CartItem.product),
             selectinload(Cart.items).selectinload(CartItem.product_variant),
+            selectinload(Cart.items).selectinload(CartItem.product_sub_variant),
         )
     ).first()
     if not cart or not cart.items:
@@ -91,38 +92,18 @@ def create_order(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Product {cart_item.product_id} not found",
             )
-        if cart_item.product_variant_id is not None:
-            variant = cart_item.product_variant
-            if not variant or variant.product_id != product.id:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail=f"The selected variant for {product.name} is unavailable",
-                )
-            if cart_item.quantity > variant.quantity:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail=f"Only {variant.quantity} units of {variant.name} are available",
-                )
-        else:
-            has_variants = session.exec(
-                select(ProductVariant.id).where(
-                    ProductVariant.product_id == product.id
-                )
-            ).first()
-            if has_variants:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail=f"A variant is required for product {product.name}",
-                )
-            if cart_item.quantity > product.quantity:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail=f"Only {product.quantity} units of {product.name} are available",
-                )
+        validate_inventory_selection(
+            session,
+            product,
+            cart_item.product_variant_id,
+            cart_item.product_sub_variant_id,
+            cart_item.quantity,
+        )
         order_items.append(
             OrderItem(
                 product_id=cart_item.product_id,
                 product_variant_id=cart_item.product_variant_id,
+                product_sub_variant_id=cart_item.product_sub_variant_id,
                 quantity=cart_item.quantity,
                 price_at_purchase=product.price,  # snapshot unit price
             )
@@ -143,7 +124,7 @@ def create_order(
     for item in order_items:
         item.order_id = order.id
         session.add(item)
-    # 6. Initialize the server-owned Paystack transaction.
+    # 6. Initialize the server-owned Afripay checkout session.
     payment = initialize_payment(session, order=order, user=current_user)
     # 7. Clear the cart after the checkout snapshot and payment session exist.
     for cart_item in cart.items:
@@ -161,14 +142,45 @@ def create_order(
         )
     ).one()
     session.refresh(payment)
-    return CheckoutRead(order=order, payment=payment)
+    return CheckoutRead(
+        order=OrderRead.model_validate(order),
+        payment=PaymentRead.model_validate(payment),
+    )
 
 @router.get("", response_model=list[OrderRead])
 def get_orders(
     session: SessionDep,
     current_user: User = Depends(get_current_user),
     page: int = Query(1, description="Page number", ge=1),
-    page_size: int = Query(10, description="Number of items per page", ge=1, le=100),
+    page_size: int = Query(10, description="Number of items per page", ge=1, le=50),
+    status: Optional[OrderStatus] = Query(None, description="Filter orders by status"),
+):
+    statement = (
+        select(Order)
+        .where(Order.user_id == current_user.id)
+        .options(
+            selectinload(Order.order_items).selectinload(OrderItem.product),
+            selectinload(Order.order_items).selectinload(OrderItem.product_variant),
+            selectinload(Order.user),
+        )
+        .order_by(Order.created_at.desc())
+    )
+
+    if status:
+        statement = statement.where(Order.status == status)
+
+    offset = (page - 1) * page_size
+    statement = statement.offset(offset).limit(page_size)
+
+    return session.exec(statement).all()
+
+
+@router.get("/all", response_model=list[OrderRead])
+def get_all_orders(
+    session: SessionDep,
+    _: User = Depends(get_current_admin),
+    page: int = Query(1, description="Page number", ge=1),
+    page_size: int = Query(10, description="Number of items per page", ge=1, le=50),
     status: Optional[OrderStatus] = Query(None, description="Filter orders by status"),
     name: Optional[str] = Query(
         None,
@@ -192,14 +204,10 @@ def get_orders(
     if name:
         statement = statement.where(col(User.name).contains(name))
 
-    if current_user.role not in {UserRole.ADMIN, UserRole.STAFF}:
-        statement = statement.where(Order.user_id == current_user.id)
-
     offset = (page - 1) * page_size
     statement = statement.offset(offset).limit(page_size)
 
-    orders = session.exec(statement).all()
-    return orders
+    return session.exec(statement).all()
 
 @router.patch("/{order_id}", response_model=OrderRead)
 def update_order_status(
@@ -319,11 +327,11 @@ def cancel_order(
         return order
 
     try:
-        result = paystack_service.create_full_refund(
+        result = afripay_service.create_full_refund(
             transaction_reference=payment.reference,
             merchant_note=f"Customer cancelled {order.public_id} within 30 minutes",
         )
-    except PaystackError as exc:
+    except AfripayError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
     provider_status = str(result.get("status", "pending")).replace("-", "_")

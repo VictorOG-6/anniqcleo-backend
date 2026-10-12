@@ -1,11 +1,14 @@
+from datetime import datetime, timezone, timedelta
+
 from fastapi import APIRouter, Depends, HTTPException, status, Request, UploadFile, File, Query
 from sqlmodel import select, col
 from sqlalchemy.orm import selectinload
-from models import UserRead, User, UserCreate, password_hash, AuthModel, UserUpdate, UserRole, Order, OrderItem
+from models import UserRead, User, UserCreate, password_hash, UserRegisterResponse, UserUpdate, UserRole, Order, OrderItem, EmailVerification
 from database import SessionDep
 from services.access_token import get_current_user, get_current_admin
+from services.email import send_verification_email
 from services.image_service import image_service
-from routers.auth import create_tokens_for_user
+from services.otp import generate_otp
 from typing import Optional
 
 router = APIRouter(prefix="/user", tags=["Users"])
@@ -21,8 +24,8 @@ def build_user_response(user: User, request: Request) -> UserRead:
         )
     return user_response
 
-@router.post("", response_model=AuthModel, status_code=status.HTTP_201_CREATED)
-def create_user(user: UserCreate, session: SessionDep):
+@router.post("", response_model=UserRegisterResponse, status_code=status.HTTP_201_CREATED)
+async def create_user(user: UserCreate, session: SessionDep):
     existing_user = session.exec(select(User).where(User.email == user.email)).first()
 
     if existing_user:
@@ -36,14 +39,22 @@ def create_user(user: UserCreate, session: SessionDep):
     session.commit()
     session.refresh(new_user)
 
-    access_token, refresh_token = create_tokens_for_user(new_user, session)
+    otp = generate_otp()
 
-    return {
-        "user": new_user,
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "token_type": "bearer",
-    }
+    verification = EmailVerification(
+        user_id=new_user.id,
+        otp_hash=password_hash.hash(otp),
+        expires_at=(datetime.now(timezone.utc) + timedelta(minutes=10)),
+        attempts=0,
+        used=False,
+    )
+
+    session.add(verification)
+    session.commit()
+
+    await send_verification_email(email=new_user.email, user_name=new_user.name, otp=otp)
+
+    return { "message": "Account created. Please verify your email.", "user": new_user, }
 
 @router.patch("", response_model=UserRead)
 def update_user(
@@ -158,6 +169,9 @@ def get_users(
             selectinload(User.orders)
             .selectinload(Order.order_items)
             .selectinload(OrderItem.product_variant),
+            selectinload(User.orders)
+            .selectinload(Order.order_items)
+            .selectinload(OrderItem.product_sub_variant),
         )
         .order_by(User.created_at.desc())
     )

@@ -1,7 +1,7 @@
 from sqlmodel import Field, SQLModel, Relationship
 from typing import Optional
 from datetime import datetime, timezone
-from pydantic import EmailStr
+from pydantic import EmailStr, model_validator
 from uuid import UUID, uuid4
 from sqlalchemy import Column, DateTime
 from enum import Enum
@@ -44,13 +44,16 @@ class User(UserBase, table=True):
         sa_column=Column(DateTime(timezone=True), nullable=False, onupdate=func.now()),
     )
     hashed_password: Optional[str] = None
+    email_verified: bool = Field(default=False)
     google_sub: Optional[str] = Field(default=None, unique=True, index=True)
     profile_image_url: Optional[str] = Field(default=None, max_length=500)
     cart: "Cart" = Relationship(back_populates="user")
     orders: list["Order"] = Relationship(back_populates="user")
     reviews: list["Review"] = Relationship(back_populates="user")
+    email_verifications: list["EmailVerification"] = Relationship(back_populates="user")
     total_orders: int = Field(default=0)
     total_spent: int = Field(default=0)
+    total_reviews: int = Field(default=0)
     role: UserRole = Field(default=UserRole.USER)
 
 class UserRead(UserBase):
@@ -60,6 +63,7 @@ class UserRead(UserBase):
     updated_at: datetime
     total_orders: int
     total_spent: int
+    total_reviews: int
     role: UserRole
 
 class UserSummary(SQLModel):
@@ -121,10 +125,35 @@ class AuthModel(SQLModel):
     refresh_token: str
     token_type: str
 
+class UserRegisterResponse(SQLModel):
+    message: str
+    user: UserRead
+
 class ProductStatus(str, Enum):
     DRAFT = "draft"
     PUBLISHED = "published"
     ARCHIVED = "archived"
+
+class ProductSubVariantBase(SQLModel):
+    size: str
+    quantity: int = Field(ge=0)
+
+class ProductSubVariant(ProductSubVariantBase, table=True):
+    id: Optional[UUID] = Field(
+        default_factory=uuid4,
+        sa_column=Column(PG_UUID(as_uuid=True), primary_key=True, unique=True, nullable=False),
+    )
+    product_variant_id: UUID = Field(foreign_key="productvariant.id", nullable=False)
+    product_variant: Optional["ProductVariant"] = Relationship(back_populates="sub_variants")
+    order_items: list["OrderItem"] = Relationship(back_populates="product_sub_variant")
+    cart_items: list["CartItem"] = Relationship(back_populates="product_sub_variant")
+
+class ProductSubVariantCreate(ProductSubVariantBase):
+    pass
+
+class ProductSubVariantRead(ProductSubVariantBase):
+    id: UUID
+    product_variant_id: UUID
 
 class ProductVariantBase(SQLModel):
     name: str
@@ -139,15 +168,20 @@ class ProductVariant(ProductVariantBase, table=True):
     )
     product_id: UUID = Field(foreign_key="product.id", nullable=False)
     product: Optional["Product"] = Relationship(back_populates="variants")
+    sub_variants: list["ProductSubVariant"] = Relationship(
+        back_populates="product_variant",
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"},
+    )
     order_items: list["OrderItem"] = Relationship(back_populates="product_variant")
     cart_items: list["CartItem"] = Relationship(back_populates="product_variant")
 
 class ProductVariantCreate(ProductVariantBase):
-    pass
+    sub_variants: Optional[list[ProductSubVariantCreate]] = None
 
 class ProductVariantRead(ProductVariantBase):
     id: UUID
     product_id: UUID
+    sub_variants: list["ProductSubVariantRead"] = Field(default_factory=list)
 
 class ProductBase(SQLModel):
     name: str
@@ -359,7 +393,21 @@ class PaymentRead(SQLModel):
     currency: str
     status: PaymentStatus
     authorization_url: Optional[str] = None
+    checkout_url: Optional[str] = None
+    access_code: Optional[str] = None
     paid_at: Optional[datetime] = None
+
+    @model_validator(mode="after")
+    def sync_checkout_fields(self) -> "PaymentRead":
+        checkout_url = self.checkout_url or self.authorization_url
+        if checkout_url and not self.authorization_url:
+            self.authorization_url = checkout_url
+        if checkout_url and not self.checkout_url:
+            self.checkout_url = checkout_url
+        if self.access_code is None and checkout_url and "/link/" in checkout_url:
+            token = checkout_url.rstrip("/").split("/link/")[-1]
+            self.access_code = token or None
+        return self
 
 class CheckoutRead(SQLModel):
     order: OrderRead
@@ -424,6 +472,13 @@ class OrderItem(SQLModel, table=True):
     product_variant: Optional["ProductVariant"] = Relationship(
         back_populates="order_items"
     )
+    product_sub_variant_id: Optional[UUID] = Field(
+        default=None,
+        foreign_key="productsubvariant.id",
+    )
+    product_sub_variant: Optional["ProductSubVariant"] = Relationship(
+        back_populates="order_items"
+    )
     quantity: int = Field(default=1, ge=1)
     price_at_purchase: int
 
@@ -436,6 +491,8 @@ class OrderItemRead(SQLModel):
     product: "ProductRead"
     product_variant_id: Optional[UUID] = None
     product_variant: Optional["ProductVariantRead"] = None
+    product_sub_variant_id: Optional[UUID] = None
+    product_sub_variant: Optional["ProductSubVariantRead"] = None
     quantity: int
     price_at_purchase: int
     
@@ -495,11 +552,19 @@ class CartItem(CartItemBase, table=True):
     product_variant: Optional["ProductVariant"] = Relationship(
         back_populates="cart_items"
     )
+    product_sub_variant_id: Optional[UUID] = Field(
+        default=None,
+        foreign_key="productsubvariant.id",
+    )
+    product_sub_variant: Optional["ProductSubVariant"] = Relationship(
+        back_populates="cart_items"
+    )
     total_price: int
     
 class CartItemCreate(CartItemBase):
     product_id: UUID
     product_variant_id: Optional[UUID] = None
+    product_sub_variant_id: Optional[UUID] = None
 
 class CartItemUpdate(SQLModel):
     quantity: Optional[int] = Field(default=None, ge=1)
@@ -513,6 +578,8 @@ class CartItemRead(CartItemBase):
     product: "ProductRead"
     product_variant_id: Optional[UUID] = None
     product_variant: Optional["ProductVariantRead"] = None
+    product_sub_variant_id: Optional[UUID] = None
+    product_sub_variant: Optional["ProductSubVariantRead"] = None
     total_price: int
 
 class ReviewBase(SQLModel):
@@ -551,4 +618,29 @@ class ReviewRead(ReviewBase):
 
 class ReviewUpdate(SQLModel):
     rating: Optional[int] = None
-    comment: Optional[str] = None 
+    comment: Optional[str] = None
+
+class EmailVerification(SQLModel, table=True):
+    id: Optional[UUID] = Field(
+        default_factory=uuid4,
+        sa_column=Column(PG_UUID(as_uuid=True), primary_key=True, unique=True, nullable=False),
+    )
+    user_id: UUID = Field(foreign_key="user.id", nullable=False, index=True)
+    user: Optional["User"] = Relationship(back_populates="email_verifications")
+    otp_hash: str = Field(nullable=False)
+    expires_at: datetime = Field(
+        sa_column=Column(DateTime(timezone=True), nullable=False)
+    )
+    attempts: int = Field(default=0, nullable=False)
+    used: bool = Field(default=False, nullable=False)
+    created_at: datetime = Field(
+        default_factory=lambda: datetime.now(timezone.utc),
+        sa_column=Column(DateTime(timezone=True), nullable=False),
+    )
+
+class VerifyOTPRequest(SQLModel):
+    email: EmailStr
+    otp: str
+
+class ResendOTPRequest(SQLModel):
+    email: EmailStr

@@ -14,11 +14,17 @@ from models import (
     RefundStatus,
     User,
 )
+from services.afripay import (
+    AfripayError,
+    afripay_service,
+    naira_to_kobo,
+    provider_amount_to_kobo,
+    resolve_checkout_session,
+)
 from services.inventory import (
     commit_inventory_for_order,
     restore_inventory_for_order,
 )
-from services.paystack import PaystackError, naira_to_kobo, paystack_service
 
 
 TERMINAL_PAYMENT_STATUSES = {
@@ -28,13 +34,19 @@ TERMINAL_PAYMENT_STATUSES = {
 }
 
 
-def _parse_paystack_datetime(value: str | None) -> datetime | None:
+def _parse_provider_datetime(value: str | None) -> datetime | None:
     if not value:
         return None
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _normalize_provider_status(status_value: str | None) -> str | None:
+    if status_value == "successful":
+        return "success"
+    return status_value
 
 
 def initialize_payment(
@@ -67,14 +79,27 @@ def initialize_payment(
     reference = f"{order.public_id}-{uuid4().hex[:16]}"
     amount_kobo = naira_to_kobo(order.total_price)
     try:
-        result = paystack_service.initialize_transaction(
+        result = afripay_service.initialize_transaction(
             email=str(user.email),
-            amount_kobo=amount_kobo,
+            name=str(user.name),
+            amount_naira=order.total_price,
             reference=reference,
             order_id=str(order.id),
+            user_id=str(user.id),
+            title=f"Payment for order {order.public_id}",
         )
-    except PaystackError as exc:
+    except AfripayError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    checkout_url, access_code = resolve_checkout_session(
+        result,
+        checkout_origin=afripay_service.checkout_origin,
+    )
+    if not checkout_url:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Afripay did not return a checkout URL",
+        )
 
     payment = Payment(
         order_id=order.id,
@@ -82,8 +107,8 @@ def initialize_payment(
         amount_kobo=amount_kobo,
         currency="NGN",
         status=PaymentStatus.PENDING,
-        access_code=result.get("access_code"),
-        authorization_url=result.get("authorization_url"),
+        access_code=access_code,
+        authorization_url=checkout_url,
     )
     order.status = OrderStatus.PROCESSING
     session.add(payment)
@@ -107,19 +132,30 @@ def apply_transaction_result(
     user = session.get(User, order.user_id)
     customer = data.get("customer") or {}
 
+    try:
+        provider_amount_kobo = provider_amount_to_kobo(data.get("amount"))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Afripay transaction amount is invalid",
+        ) from exc
+
     if (
         data.get("reference") != payment.reference
-        or int(data.get("amount", -1)) != payment.amount_kobo
+        or provider_amount_kobo != payment.amount_kobo
         or data.get("currency") != payment.currency
         or (customer.get("email") and str(customer["email"]).lower() != str(user.email).lower())
     ):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Paystack transaction details do not match the order",
+            detail="Afripay transaction details do not match the order",
         )
 
-    provider_status = data.get("status")
-    payment.provider_transaction_id = str(data.get("id")) if data.get("id") else None
+    provider_status = _normalize_provider_status(data.get("status"))
+    transaction_id = data.get("transaction_id") or data.get("id")
+    payment.provider_transaction_id = (
+        str(transaction_id) if transaction_id is not None else None
+    )
     if provider_status == "success":
         if payment.status in {
             PaymentStatus.REFUND_PENDING,
@@ -135,8 +171,8 @@ def apply_transaction_result(
         payment.status = PaymentStatus.SUCCESS
         if payment.paid_at is None:
             payment.paid_at = (
-                _parse_paystack_datetime(data.get("paid_at"))
-                or _parse_paystack_datetime(data.get("paidAt"))
+                _parse_provider_datetime(data.get("paid_at"))
+                or _parse_provider_datetime(data.get("paidAt"))
                 or datetime.now(timezone.utc)
             )
         if order.status not in {
@@ -171,8 +207,8 @@ def apply_transaction_result(
 
 def verify_payment(session: Session, payment: Payment) -> Payment:
     try:
-        data = paystack_service.verify_transaction(payment.reference)
-    except PaystackError as exc:
+        data = afripay_service.verify_transaction(payment.reference)
+    except AfripayError as exc:
         raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
     return apply_transaction_result(session, payment=payment, data=data)
 
@@ -221,7 +257,7 @@ def apply_refund_event(
     ):
         raise HTTPException(
             status_code=400,
-            detail="Paystack refund details do not match the payment",
+            detail="Afripay refund details do not match the payment",
         )
 
     provider_refund_id = data.get("refund_reference") or data.get("id")

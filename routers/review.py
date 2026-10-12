@@ -13,7 +13,7 @@ from models import (
     User,
 )
 from database import SessionDep
-from services.access_token import get_current_user
+from services.access_token import get_current_admin, get_current_user
 from sqlmodel import select
 from uuid import UUID
 from typing import Optional
@@ -45,7 +45,9 @@ def create_review(review: ReviewCreate, session: SessionDep, current_user: User 
         )
 
     new_review = Review(**review.model_dump(), user_id=current_user.id)
+    current_user.total_reviews += 1
     session.add(new_review)
+    session.add(current_user)
     session.commit()
     session.refresh(new_review)
 
@@ -64,24 +66,60 @@ def get_reviews(
     session: SessionDep,
     current_user: User = Depends(get_current_user),
     product_id: Optional[UUID] = None,
+    page: int = Query(1, description="Page number", ge=1),
+    page_size: int = Query(10, description="Number of items per page", ge=1, le=500),
+):
+    statement = (
+        select(Review)
+        .where(Review.user_id == current_user.id)
+        .options(
+            selectinload(Review.product),
+            selectinload(Review.user),
+        )
+        .order_by(Review.created_at.desc())
+    )
+    if product_id:
+        statement = statement.where(Review.product_id == product_id)
+
+    offset = (page - 1) * page_size
+    statement = statement.offset(offset).limit(page_size)
+
+    return session.exec(statement).all()
+
+
+@router.get("/all", response_model=list[ReviewRead])
+def get_all_reviews(
+    session: SessionDep,
+    _: User = Depends(get_current_admin),
+    product_id: Optional[UUID] = None,
     user_id: Optional[UUID] = None,
     page: int = Query(1, description="Page number", ge=1),
-    page_size: int = Query(50, description="Number of items per page", ge=1, le=100),
-    ):
-    statement = select(Review).where(Review.user_id == current_user.id)
-    if (product_id):
+    page_size: int = Query(20, description="Number of items per page", ge=1, le=50),
+):
+    statement = (
+        select(Review)
+        .options(
+            selectinload(Review.product),
+            selectinload(Review.user),
+        )
+        .order_by(Review.created_at.desc())
+    )
+    if product_id:
         statement = statement.where(Review.product_id == product_id)
-    if (user_id):
+    if user_id:
         statement = statement.where(Review.user_id == user_id)
-    reviews = session.exec(statement).all()
-    return reviews
+
+    offset = (page - 1) * page_size
+    statement = statement.offset(offset).limit(page_size)
+
+    return session.exec(statement).all()
 
 @router.get("/eligible-products", response_model=list[ProductRead])
 def get_review_eligible_products(
     session: SessionDep,
     current_user: User = Depends(get_current_user),
     page: int = Query(1, description="Page number", ge=1),
-    page_size: int = Query(50, description="Number of items per page", ge=1, le=100),
+    page_size: int = Query(50, description="Number of items per page", ge=1, le=50),
 ):
     statement = (
         select(Product)
@@ -119,6 +157,8 @@ def delete_review(review_id: UUID, session: SessionDep, current_user: User = Dep
     deleted_review = session.exec(select(Review).where(Review.id == review_id, Review.user_id == current_user.id)).first()
     if not deleted_review:
         raise HTTPException(status_code=404, detail="Review not found")
+    current_user.total_reviews = max(0, current_user.total_reviews - 1)
     session.delete(deleted_review)
+    session.add(current_user)
     session.commit()
     return None

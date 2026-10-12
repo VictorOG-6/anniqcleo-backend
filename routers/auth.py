@@ -13,6 +13,9 @@ from models import (
     RefreshTokenRequest,
     AuthModel,
     GoogleUser,
+    VerifyOTPRequest,
+    ResendOTPRequest,
+    EmailVerification,
 )
 from database import SessionDep
 from services.access_token import (
@@ -22,6 +25,8 @@ from services.access_token import (
 )
 from authlib.integrations.starlette_client import OAuth
 from services.google import get_or_create_google_user
+from services.email import send_welcome_email, send_verification_email
+from services.otp import generate_otp
 import os
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
@@ -137,6 +142,12 @@ def login(request: Login, session: SessionDep):
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect Credentials",
             headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if not user.email_verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Please verify your email before logging in",
         )
 
     access_token, refresh_token = create_tokens_for_user(user, session)
@@ -261,3 +272,135 @@ def logout(request: Request, response: Response, session: SessionDep):
     response.delete_cookie("refresh_token")
 
     return {"message": "Successfully logged out"}
+
+@router.post("/verify-otp")
+async def verify_otp(request: VerifyOTPRequest, session: SessionDep):
+    user = session.exec(select(User).where(User.email == request.email)).first()
+
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found",
+        )
+
+    if user.email_verified:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already verified",
+        )
+    
+    verification = session.exec(
+        select(EmailVerification)
+        .where(EmailVerification.user_id == user.id, EmailVerification.used == False)
+        .order_by(EmailVerification.created_at.desc())
+    ).first()
+
+    if not verification:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Verification code not found",
+        )
+
+    expires_at = verification.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+
+    if expires_at < datetime.now(timezone.utc):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Verification code has expired",
+        )
+        
+    if verification.attempts >= 3:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Too many attempts",
+        )
+
+    if not password_hash.verify(request.otp, verification.otp_hash):
+        verification.attempts += 1
+        session.commit()
+
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid verification code",
+        )
+
+    user.email_verified = True
+
+    verification.used = True
+
+    session.add(user)
+    session.add(verification)
+    session.commit()
+
+    await send_welcome_email(
+        email=user.email,
+        user_name=user.name,
+    )
+
+    access_token, refresh_token = create_tokens_for_user(user, session)
+
+    return {
+        "message": "Email verified successfully",
+        "user": user,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+    }
+
+@router.post("/resend-otp")
+async def resend_otp(request: ResendOTPRequest, session: SessionDep):
+    user = session.exec(select(User).where(User.email == request.email)).first()
+
+    if not user:
+        # In production, consider returning a generic 
+        # response here to avoid email enumeration.
+        {
+            "message": "If an account email exists for this email, a verification code has been sent.",
+        }     
+
+    if user.email_verified:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already verified",
+        )
+        
+    latest_verification = session.exec(select(EmailVerification)
+        .where(EmailVerification.user_id == user.id)
+        .order_by(EmailVerification.created_at.desc())).first()
+
+    if latest_verification:
+        elapsed = (datetime.now(timezone.utc) - latest_verification.created_at)
+        if elapsed < timedelta(seconds=60):
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Please wait before requesting another code",
+            )
+
+    otp = generate_otp()
+
+    previous_verifications = session.exec(select(EmailVerification).where(EmailVerification.user_id == user.id, EmailVerification.used == False)).all()
+    for verification in previous_verifications:
+        verification.used = True
+        session.add(verification)
+    
+    new_verification = EmailVerification(
+        user_id=user.id,
+        otp_hash=password_hash.hash(otp),
+        expires_at=(datetime.now(timezone.utc) + timedelta(minutes=10)),
+        attempts=0,
+        used=False,
+    )
+    session.add(new_verification)
+    session.commit()
+
+    await send_verification_email(
+        email=user.email,
+        user_name=user.name,
+        otp=otp,
+    )
+
+    return {
+        "message": "A new verification code has been sent",
+    }

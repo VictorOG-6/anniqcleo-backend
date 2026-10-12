@@ -1,10 +1,23 @@
 from fastapi import APIRouter, status, Depends, Query, HTTPException
-from models import ProductRead, ProductCreate, Product, ProductUpdate, ProductVariant, User, ProductStatus, ProductCategorySummary, OrderItem
+from models import (
+    ProductRead,
+    ProductCreate,
+    Product,
+    ProductUpdate,
+    ProductVariant,
+    ProductVariantCreate,
+    ProductSubVariant,
+    User,
+    ProductStatus,
+    ProductCategorySummary,
+    OrderItem,
+)
 from database import SessionDep
 from services.access_token import get_current_admin
 from typing import Optional
 from sqlmodel import select, col
 from sqlalchemy import func
+from sqlalchemy.orm import selectinload
 import re
 
 router = APIRouter(prefix="/product", tags=["Products"])
@@ -30,6 +43,33 @@ def generate_unique_product_slug(session: SessionDep, name: str, product_id: Opt
         suffix += 1
         slug = f"{base_slug}-{suffix}"
 
+def validate_variant_sub_variants(variant: ProductVariantCreate) -> None:
+    sub_variants = variant.sub_variants or []
+    if not sub_variants:
+        return
+
+    sub_variant_total = sum(sub_variant.quantity for sub_variant in sub_variants)
+    if sub_variant_total != variant.quantity:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Sub-variant quantities for '{variant.name}' must sum to "
+                f"the variant quantity ({variant.quantity}), got {sub_variant_total}"
+            ),
+        )
+
+def build_product_variant(variant: ProductVariantCreate) -> ProductVariant:
+    validate_variant_sub_variants(variant)
+    variant_data = variant.model_dump(exclude={"sub_variants"})
+    product_variant = ProductVariant(**variant_data)
+    sub_variants = variant.sub_variants or []
+    if sub_variants:
+        product_variant.sub_variants = [
+            ProductSubVariant(**sub_variant.model_dump())
+            for sub_variant in sub_variants
+        ]
+    return product_variant
+
 @router.post("", response_model=ProductRead, status_code=status.HTTP_201_CREATED)
 def create_product(product: ProductCreate, session: SessionDep, current_admin: User = Depends(get_current_admin)):
     variants_data = product.variants or []
@@ -40,7 +80,7 @@ def create_product(product: ProductCreate, session: SessionDep, current_admin: U
 
     new_product = Product(**product_data)
     new_product.variants = [
-        ProductVariant(**variant.model_dump())
+        build_product_variant(variant)
         for variant in variants_data
     ]
     session.add(new_product)
@@ -59,7 +99,9 @@ def get_products(
     page_size: int = Query(10, description="Number of items per page", ge=1, le=100),
     ):
     
-    statement = select(Product)
+    statement = select(Product).options(
+        selectinload(Product.variants).selectinload(ProductVariant.sub_variants)
+    )
 
     if (name):
         statement = statement.where(col(Product.name).contains(name))
@@ -95,7 +137,13 @@ def get_product_categories_summary(
 
 @router.get("/{product_id}", response_model=ProductRead)
 def get_product_by_id(product_id: str, session: SessionDep):
-    product = session.exec(select(Product).where(Product.id == product_id)).first()
+    product = session.exec(
+        select(Product)
+        .where(Product.id == product_id)
+        .options(
+            selectinload(Product.variants).selectinload(ProductVariant.sub_variants)
+        )
+    ).first()
     if not product:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
     return product
@@ -124,7 +172,7 @@ def update_product(product_id: str, product_update: ProductUpdate, session: Sess
     if product_update.variants is not None:
         updated_product.variants.clear()
         updated_product.variants.extend(
-            ProductVariant(**variant.model_dump())
+            build_product_variant(variant)
             for variant in product_update.variants
         )
 

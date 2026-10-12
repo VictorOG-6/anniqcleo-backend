@@ -1,7 +1,18 @@
 from fastapi import APIRouter, status, Depends, Query, HTTPException
-from models import Cart, CartRead, CartItemCreate, CartItemRead, CartItem, CartItemUpdate, Product, ProductVariant, User
+from models import (
+    Cart,
+    CartRead,
+    CartItemCreate,
+    CartItemRead,
+    CartItem,
+    CartItemUpdate,
+    Product,
+    ProductVariant,
+    User,
+)
 from database import SessionDep
 from services.access_token import get_current_user
+from services.inventory import validate_inventory_selection
 from uuid import UUID
 from sqlmodel import select
 from sqlalchemy import func
@@ -17,6 +28,7 @@ def get_or_create_cart(session: SessionDep, current_user: User) -> Cart:
         .options(
             selectinload(Cart.items).selectinload(CartItem.product),
             selectinload(Cart.items).selectinload(CartItem.product_variant),
+            selectinload(Cart.items).selectinload(CartItem.product_sub_variant),
             selectinload(Cart.user),
         )
     ).first()
@@ -46,44 +58,6 @@ def refresh_cart_totals(session: SessionDep, cart_id: UUID) -> Cart:
     session.add(cart)
     return cart
 
-def validate_inventory_selection(
-    session: SessionDep,
-    product: Product,
-    product_variant_id: UUID | None,
-    quantity: int,
-) -> None:
-    if product_variant_id is not None:
-        variant = session.exec(
-            select(ProductVariant).where(
-                ProductVariant.id == product_variant_id,
-                ProductVariant.product_id == product.id,
-            )
-        ).first()
-        if not variant:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="The selected variant does not belong to this product",
-            )
-        available_quantity = variant.quantity
-        inventory_name = variant.name
-    else:
-        has_variants = session.exec(
-            select(ProductVariant.id).where(ProductVariant.product_id == product.id)
-        ).first()
-        if has_variants:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="A product variant must be selected",
-            )
-        available_quantity = product.quantity
-        inventory_name = product.name
-
-    if quantity > available_quantity:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Only {available_quantity} units of {inventory_name} are available",
-        )
-
 def _add_or_merge_cart_item(session: SessionDep, current_user: User, item: CartItemCreate, product: Product) -> UUID:
     cart = get_or_create_cart(session, current_user)
     existing_item = session.exec(
@@ -92,6 +66,7 @@ def _add_or_merge_cart_item(session: SessionDep, current_user: User, item: CartI
             CartItem.cart_id == cart.id,
             CartItem.product_id == item.product_id,
             CartItem.product_variant_id == item.product_variant_id,
+            CartItem.product_sub_variant_id == item.product_sub_variant_id,
         )
     ).first()
 
@@ -107,6 +82,7 @@ def _add_or_merge_cart_item(session: SessionDep, current_user: User, item: CartI
             cart_id=cart.id,
             product_id=item.product_id,
             product_variant_id=item.product_variant_id,
+            product_sub_variant_id=item.product_sub_variant_id,
             quantity=item.quantity,
             total_price=item.quantity * product.price,
         )
@@ -125,6 +101,7 @@ def create_cart_item(item: CartItemCreate, session: SessionDep, current_user: Us
         session,
         product,
         item.product_variant_id,
+        item.product_sub_variant_id,
         item.quantity,
     )
 
@@ -144,6 +121,7 @@ def create_cart_item(item: CartItemCreate, session: SessionDep, current_user: Us
         .options(
             selectinload(CartItem.product),
             selectinload(CartItem.product_variant),
+            selectinload(CartItem.product_sub_variant),
         )
     ).one()
 
@@ -160,6 +138,7 @@ def get_cart(
         .options(
             selectinload(Cart.items).selectinload(CartItem.product),
             selectinload(Cart.items).selectinload(CartItem.product_variant),
+            selectinload(Cart.items).selectinload(CartItem.product_sub_variant),
             selectinload(Cart.user),
         )
     ).first()
@@ -178,6 +157,7 @@ def update_cart_item(item_id: UUID, item_update: CartItemUpdate, session: Sessio
         .options(
             selectinload(CartItem.product),
             selectinload(CartItem.product_variant),
+            selectinload(CartItem.product_sub_variant),
         )
     ).first()
     if not updated_item:
@@ -191,6 +171,7 @@ def update_cart_item(item_id: UUID, item_update: CartItemUpdate, session: Sessio
         session,
         updated_item.product,
         updated_item.product_variant_id,
+        updated_item.product_sub_variant_id,
         requested_quantity,
     )
     updated_item.sqlmodel_update(item_update.model_dump(exclude_unset=True))
